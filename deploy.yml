@@ -20,4 +20,4 @@ jobs:
           username: dev@avengers.topscripts.in
           password: ${{ secrets.FTPPASSWORD }}
           protocol: ftps
-          server-dir: https://avengers.topscripts.in/harsh/laravel-CRM
+          server-dir: /harsh/laravel-CRM
