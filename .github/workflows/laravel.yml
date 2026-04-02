@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: shivammathur/setup-php@15c43e89cdef867065b0213be354c2841860869e
         with:
-          php-version: '8.0'
+          php-version: '8.2'
 
       - uses: actions/checkout@v4
 
@@ -21,7 +21,7 @@ jobs:
         run: php -r "file_exists('.env') || copy('.env.example', '.env');"
 
       - name: Install Dependencies
-        run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+        run: composer update -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
 
       - name: Generate key
         run: php artisan key:generate
@@ -43,7 +43,7 @@ jobs:
   # ─── JOB 2: Deploy via FTP (only runs AFTER tests pass) ─────
   deploy:
     runs-on: ubuntu-latest
-    needs: laravel-tests        
+    needs: laravel-tests
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
@@ -57,4 +57,4 @@ jobs:
           username: dev@avengers.topscripts.in
           password: Baseline@123
           local-dir: ./
-          server-dir: /Harsh/laravel-CRM
+          server-dir: /Harsh/laravel-CRM/
