@@ -6,29 +6,33 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Auth;
-use Tymon\JWTAuth\Facades\JWTAuth;
-use Tymon\JWTAuth\Exceptions\JWTException;
 use Carbon\Carbon;
 use PragmaRX\Google2FA\Google2FA;
 
 class UserController extends Controller
 {
-    // ─── Register ──────────────────────────────────
+    // ─── Register ──────────────────────────────────────────────────────────────
     public function userRegister(Request $request)
     {
         $data = $request->validate([
-            "name" => "required|string|max:255",
-            "email" => "required|string|email|unique:users,email",
-            "password" => "required|string|min:6|confirmed",
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|unique:users,email',
+            'password' => 'required|string|min:6|confirmed',
+            'role' => 'sometimes|in:admin,staff,customer',
+            'phone' => 'nullable|string|max:20',
+            'address' => 'nullable|string|max:500',
         ]);
 
         $user = User::create([
             'name' => $data['name'],
             'email' => $data['email'],
             'password' => Hash::make($data['password']),
+            'role' => $data['role'] ?? 'customer',
+            'phone' => $data['phone'] ?? null,
+            'address' => $data['address'] ?? null,
         ]);
 
-        // ✅ Auto setup 2FA on register
+        // Auto-generate 2FA secret on register
         $google2fa = new Google2FA();
         $secret = $google2fa->generateSecretKey();
 
@@ -36,36 +40,27 @@ class UserController extends Controller
         $user->two_factor_enabled = false;
         $user->save();
 
-        $qrCodeUrl = $google2fa->getQRCodeUrl(
-            config('app.name'),
-            $user->email,
-            $secret
-        );
-
-        // ✅ Use Google Chart API to generate QR — no GD/Imagick needed
+        $qrCodeUrl = $google2fa->getQRCodeUrl(config('app.name'), $user->email, $secret);
         $qrCodeImage = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' . urlencode($qrCodeUrl);
 
         $accessToken = $user->createToken('api-token')->plainTextToken;
         $refreshToken = $user->createRefreshToken();
 
         return response()->json([
-            "status" => "success",
-            "message" => "User registered successfully",
-            "access_token" => $accessToken,
-            "refresh_token" => $refreshToken,
-            "token_type" => "bearer",
-            "expires_in" => 60 * 60,
-            "secret" => $secret,
-            "qr_code_url" => $qrCodeUrl,
-            "qr_code_image" => $qrCodeImage,
-            "user" => $user->makeHidden([
-                'refresh_token',
-                'refresh_token_expires_at',
-                'two_factor_secret'
-            ])
+            'status' => 'success',
+            'message' => 'User registered successfully',
+            'access_token' => $accessToken,
+            'refresh_token' => $refreshToken,
+            'token_type' => 'bearer',
+            'expires_in' => 3600,
+            'secret' => $secret,
+            'qr_code_url' => $qrCodeUrl,
+            'qr_code_image' => $qrCodeImage,
+            'user' => $user->makeHidden(['refresh_token', 'refresh_token_expires_at', 'two_factor_secret']),
         ], 201);
     }
-    // ─── Login ─────────────────────────────────────
+
+    // ─── Login ─────────────────────────────────────────────────────────────────
     public function loginUser(Request $request)
     {
         $request->validate([
@@ -73,77 +68,217 @@ class UserController extends Controller
             'password' => 'required|string',
         ]);
 
-        if (!Auth::attempt($request->only('email', 'password'))) {
+        if (!Auth::attempt($request->only('email', 'password'), true)) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Invalid email or password'
+                'message' => 'Invalid email or password',
             ], 401);
         }
 
+        // Regenerate session ID after login (security)
+        $request->session()->regenerate();
+
         $user = Auth::user();
 
-        // 🔥 Important Debug (temporary rakho)
-        \Log::info('Login Attempt', [
+        \Log::info('Login OK', [
+            'user_id' => $user->id,
             'email' => $user->email,
-            'two_factor_enabled' => $user->two_factor_enabled,
-            'has_secret' => !empty($user->two_factor_secret)
+            'role' => $user->role,
+            'session_id' => session()->getId(),
         ]);
 
-        // Agar 2FA enabled hai to QR + OTP maango
+        // ── 2FA check ────────────────────────────────────────────────────────
         if ($user->two_factor_enabled && $user->two_factor_secret) {
+            // Log out temporarily — login again only after OTP verified
+            Auth::logout();
+            $request->session()->invalidate();
+            $request->session()->regenerateToken();
 
-            // Decrypt the stored secret (same as register — it's stored encrypted)
             $secret = decrypt($user->two_factor_secret);
-
-            // Build the otpauth:// URL (same as register's getQRCodeUrl output)
-            $google2fa   = new Google2FA();
-            $qrCodeUrl   = $google2fa->getQRCodeUrl(
-                config('app.name'),
-                $user->email,
-                $secret
-            );
-
-            // Generate QR image via qrserver.com — no GD/Imagick needed (same as register)
+            $google2fa = new Google2FA();
+            $qrCodeUrl = $google2fa->getQRCodeUrl(config('app.name'), $user->email, $secret);
             $qrCodeImage = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' . urlencode($qrCodeUrl);
 
-            // Short-lived temp token for the verify step (10 min)
-            $tempToken = $user->createToken('2fa-login-temp', ['2fa:verify'], now()->addMinutes(10))
-                ->plainTextToken;
-
-            \Log::info('2FA Login - QR Generated', [
-                'email'  => $user->email,
-                'qr_url' => $qrCodeUrl,
-            ]);
+            // Store user ID in session for the verify step
+            session(['2fa:user:id' => $user->id]);
 
             return response()->json([
-                'status'        => 'success',
-                'message'       => 'Two-factor authentication required',
-                'requires_2fa'  => true,
-                'temp_token'    => $tempToken,
-                'qr_code_url'   => $qrCodeUrl,    // otpauth:// URI
-                'qr_code_image' => $qrCodeImage,  // Blade JS injects this into #qrFrame
-                'secret_key'    => $secret,        // shown in the manual key input
+                'status' => 'success',
+                'requires_2fa' => true,
+                'qr_code_image' => $qrCodeImage,
+                'qr_code_url' => $qrCodeUrl,
+                'secret_key' => $secret,
             ]);
         }
 
-        // Normal login (2FA off hai)
-        $accessToken = $user->createToken('auth-token')->plainTextToken;
-
+        // ── Normal login — session is set, just redirect ──────────────────────
         return response()->json([
             'status' => 'success',
-            'message' => 'Login successful',
-            "requires_2fa" => false,
-            'access_token' => $accessToken,
-            'redirect' => '/dashboard'
+            'requires_2fa' => false,
+            'redirect' => '/dashboard',
+            'user' => [
+                'id' => $user->id,
+                'name' => $user->name,
+                'email' => $user->email,
+                'role' => $user->role,
+            ],
         ]);
     }
 
-    // ─── Refresh Token ─────────────────────────────
-    public function refreshToken(Request $request)
+    // ─── Verify 2FA OTP ────────────────────────────────────────────────────────
+    public function verify2FA(Request $request)
+    {
+        $request->validate(['code' => 'required|digits:6']);
+
+        $userId = session('2fa:user:id');
+
+        if (!$userId) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Session expired. Please log in again.',
+            ], 401);
+        }
+
+        $user = User::find($userId);
+
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'User not found.',
+            ], 404);
+        }
+
+        $google2fa = new Google2FA();
+        $secret = decrypt($user->two_factor_secret);
+        $valid = $google2fa->verifyKey($secret, $request->code);
+
+        if (!$valid) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Invalid OTP. Try again.',
+            ], 422);
+        }
+
+        // ✅ OTP verified — now fully log in via session
+        Auth::login($user);
+        $request->session()->regenerate();
+        session()->forget('2fa:user:id');
+
+        return response()->json([
+            'status' => 'success',
+            'redirect' => '/dashboard',
+            'user' => [
+                'id' => $user->id,
+                'name' => $user->name,
+                'email' => $user->email,
+                'role' => $user->role,
+            ],
+        ]);
+    }
+
+    // ─── Enable 2FA ────────────────────────────────────────────────────────────
+    public function enable2FA(Request $request)
+    {
+        $request->validate(['code' => 'required|digits:6']);
+
+        $user = Auth::user();
+
+        if (!$user) {
+            return response()->json(['status' => 'error', 'message' => 'Unauthorized'], 401);
+        }
+
+        if (!$user->two_factor_secret) {
+            return response()->json(['status' => 'error', 'message' => '2FA setup not initiated'], 400);
+        }
+
+        $google2fa = new Google2FA();
+        $secret = decrypt($user->two_factor_secret);
+        $valid = $google2fa->verifyKey($secret, $request->code);
+
+        if (!$valid) {
+            return response()->json(['status' => 'error', 'message' => 'Invalid 2FA code'], 422);
+        }
+
+        $user->two_factor_enabled = true;
+        $user->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Two-factor authentication enabled successfully',
+        ]);
+    }
+
+    // ─── Toggle 2FA ────────────────────────────────────────────────────────────
+    public function toggle2FA(Request $request)
     {
         $request->validate([
-            'refresh_token' => 'required|string'
+            'enable' => 'required|boolean',
         ]);
+
+        $user = Auth::user();
+
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized. Please login again.'
+            ], 401);
+        }
+
+        $user->two_factor_enabled = $request->enable;
+        $user->save();
+
+        return response()->json([
+            'status' => 'success',
+            'enabled' => $user->two_factor_enabled,
+            'message' => $request->enable
+                ? 'Two-factor authentication has been enabled successfully.'
+                : 'Two-factor authentication has been disabled successfully.',
+        ]);
+    }
+
+    // ─── Get User Profile ───────────────────────────────────────────────────────
+    public function me()
+    {
+        $user = Auth::user();
+
+        if (!$user) {
+            return response()->json(['status' => 'error', 'message' => 'Unauthorized'], 401);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'user' => $user->makeHidden(['refresh_token', 'refresh_token_expires_at', 'two_factor_secret']),
+        ]);
+    }
+
+    // ─── Logout ────────────────────────────────────────────────────────────────
+    public function logout(Request $request)
+    {
+        $user = Auth::user();
+
+        if ($user) {
+            $user->tokens()->delete();
+            $user->revokeRefreshToken();
+        }
+
+        Auth::logout();
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        if ($request->expectsJson()) {
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Logged out successfully',
+            ]);
+        }
+
+        return redirect()->route('login')->with('status', 'You have been logged out.');
+    }
+
+    // ─── Refresh Token ─────────────────────────────────────────────────────────
+    public function refreshToken(Request $request)
+    {
+        $request->validate(['refresh_token' => 'required|string']);
 
         $user = User::where('refresh_token', $request->refresh_token)
             ->where('refresh_token_expires_at', '>', Carbon::now())
@@ -152,261 +287,55 @@ class UserController extends Controller
         if (!$user) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Invalid or expired refresh token'
+                'message' => 'Invalid or expired refresh token',
             ], 401);
         }
 
         $newAccessToken = $user->createToken('api-token')->plainTextToken;
-        $newRefreshToken = $user->createRefreshToken(); // token rotation
+        $newRefreshToken = $user->createRefreshToken();
 
         return response()->json([
             'status' => 'success',
             'access_token' => $newAccessToken,
             'refresh_token' => $newRefreshToken,
             'token_type' => 'bearer',
-            'expires_in' => 60 * 60
+            'expires_in' => 3600,
         ]);
     }
 
-    // ─── Logout ────────────────────────────────────
-    public function logout(Request $request)
+    // ─── Users CRUD ────────────────────────────────────────────────────────────
+    public function index()
     {
-        try {
-            $user = Auth::guard('api')->user();
-
-            if ($user) {
-                $user->revokeRefreshToken();
-            }
-
-            Auth::guard('api')->logout();
-
-            return response()->json([
-                "status" => "success",
-                "message" => "Logged out successfully"
-            ]);
-        } catch (JWTException $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Failed to logout'
-            ], 500);
-        }
+        $users = User::all();
+        return view('users.index', compact('users'));
     }
 
-    // ─── Simple Toggle 2FA (0 <-> 1) ─────────────────────
-    // ─── Toggle 2FA ────────────────────────────────
-    public function toggle2FA(Request $request)
+    public function create()
     {
-        $request->validate(['enable' => 'required|boolean']);
-
-        $token = $request->bearerToken();
-        $personalToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-
-        if (!$personalToken) {
-            return response()->json(['status' => 'error', 'message' => 'Unauthenticated'], 401);
-        }
-
-        $user = $personalToken->tokenable;
-        $user->two_factor_enabled = $request->enable;
-        $user->save();
-
-        return response()->json([
-            'status' => 'success',
-            'enabled' => $user->two_factor_enabled,
-            'message' => $request->enable ? '2FA enabled' : '2FA disabled'
-        ]);
+        return view('users.create');
     }
 
-    // ─── Get User Profile ──────────────────────────
-    public function me()
+    public function edit($id)
     {
-        $user = Auth::guard('api')->user() ?? Auth::user();
-
-        if (!$user) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Unauthorized'
-            ], 401);
-        }
-
-        return response()->json([
-            'status' => 'success',
-            'user' => $user->makeHidden([
-                'refresh_token',
-                'refresh_token_expires_at',
-                'two_factor_secret'
-            ])
-        ]);
+        $user = User::findOrFail($id);
+        return view('users.edit', compact('user'));
     }
 
-    // ─── Setup 2FA ─────────────────────────────────
-    public function setup2FA()
+    public function update(Request $request, $id)
     {
-        $user = Auth::guard('api')->user();
-        $google2fa = new Google2FA();
-
-        $secret = $google2fa->generateSecretKey();
-
-        // Store encrypted secret (not enabled yet)
-        $user->two_factor_secret = encrypt($secret);
-        $user->two_factor_enabled = false;
-        $user->save();
-
-        $qrCodeUrl = $google2fa->getQRCodeUrl(
-            config('app.name'),
-            $user->email,
-            $secret
-        );
-
-        return response()->json([
-            'status' => 'success',
-            'secret' => $secret,
-            'qr_code_url' => $qrCodeUrl,
-            'message' => 'Scan the QR code with Google Authenticator'
+        $user = User::findOrFail($id);
+        $user->update([
+            'name' => $request->name,
+            'email' => $request->email,
+            'phone' => $request->phone,
+            'role' => $request->role,
         ]);
+        return redirect()->route('users.index')->with('success', 'User updated');
     }
 
-    // ─── Enable 2FA ────────────────────────────────
-    public function enable2FA(Request $request)
+    public function destroy($id)
     {
-        $request->validate(['code' => 'required|digits:6']);
-
-        // Log everything useful
-        \Log::info('2FA Enable Request', [
-            'headers' => $request->headers->all(),
-            'bearer_token' => $request->bearerToken(),
-            'authorization_header' => $request->header('Authorization'),
-            'all_input' => $request->all(),
-        ]);
-
-        // ✅ Authorization header se token nikalo
-        $token = $request->bearerToken();
-
-
-        if (!$token) {
-            return response()->json(['status' => 'error', 'message' => 'No token provided'], 401);
-        }
-
-        // ✅ Sanctum token se user nikalo
-        $personalToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-
-        if (!$personalToken) {
-            return response()->json(['status' => 'error', 'message' => 'Invalid token'], 401);
-        }
-
-        $user = $personalToken->tokenable;
-
-        if (!$user) {
-            return response()->json(['status' => 'error', 'message' => 'User not found'], 401);
-        }
-
-        $google2fa = new Google2FA();
-
-        if (!$user->two_factor_secret) {
-            return response()->json([
-                'status' => 'error',
-                'message' => '2FA setup not initiated'
-            ], 400);
-        }
-
-        $secret = decrypt($user->two_factor_secret);
-        $valid = $google2fa->verifyKey($secret, $request->code);
-
-        if (!$valid) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Invalid 2FA code'
-            ], 422);
-        }
-
-        $user->two_factor_enabled = true;
-        $user->save();
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Two-factor authentication has been enabled successfully'
-        ]);
-    }
-
-    public function verify2FA(Request $request)
-    {
-        $request->validate([
-            'code' => 'required|digits:6'
-        ]);
-
-        $token = $request->bearerToken();
-
-        if (!$token) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'No token provided'
-            ], 401);
-        }
-
-        // Debug log
-        \Log::info('2FA Verify Attempt', [
-            'bearer_token_present' => !empty($token),
-            'code' => $request->code
-        ]);
-
-        $personalToken = \Laravel\Sanctum\PersonalAccessToken::findToken($token);
-
-        if (!$personalToken) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Invalid or expired token'
-            ], 401);
-        }
-
-        if ($personalToken->expires_at && $personalToken->expires_at->isPast()) {
-            $personalToken->delete();
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Token has expired'
-            ], 401);
-        }
-
-        $user = $personalToken->tokenable;
-
-        if (!$user || !$user->two_factor_secret) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'User or 2FA not found'
-            ], 401);
-        }
-
-        $google2fa = new Google2FA();
-        $secret = decrypt($user->two_factor_secret);
-        $valid = $google2fa->verifyKey($secret, $request->code);
-
-        if (!$valid) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Invalid 2FA code'
-            ], 422);
-        }
-
-        // Success - delete temp token and create real one
-        $personalToken->delete();
-
-        $accessToken = $user->createToken('auth-token')->plainTextToken;
-
-        return response()->json([
-            'status' => 'success',
-            'message' => '2FA verified successfully',
-            'access_token' => $accessToken,
-            'redirect' => '/dashboard'
-        ]);
-    }
-
-    // ─── Optional: Revoke all tokens ───────────────
-    public function revokeAllTokens()
-    {
-        $user = Auth::guard('api')->user();
-        $user->revokeRefreshToken();
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'All refresh tokens revoked successfully'
-        ]);
+        User::findOrFail($id)->delete();
+        return redirect()->route('users.index')->with('success', 'User deleted');
     }
 }

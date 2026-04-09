@@ -467,6 +467,7 @@ async function submitCredentials() {
         'Accept':        'application/json',
         'X-CSRF-TOKEN':  document.querySelector('meta[name="csrf-token"]').content,
       },
+       credentials: 'include', 
       body: JSON.stringify({ email, password }),
     });
     const data = await res.json();
@@ -500,9 +501,7 @@ async function submitCredentials() {
 
     } else if (data.status === 'success' && !data.requires_2fa) {
       // ✅ two_factor_enabled = 0 → seedha dashboard
-      localStorage.setItem('access_token',  data.access_token ?? '');
-      localStorage.setItem('refresh_token', data.refresh_token ?? '');
-      window.location.href = '/dashboard';
+      window.location.href = data.redirect ?? '/dashboard';
 
     } else {
       showAlert(data.message || 'Invalid credentials.');
@@ -534,6 +533,7 @@ async function submitTwoFA() {
         'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
         'Authorization': `Bearer ${tempToken}`,   // ← Send temp_token as Bearer
       },
+      credentials: 'include',
       body: JSON.stringify({ code: code }),       // temp_token already in header
     });
 
